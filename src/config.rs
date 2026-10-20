@@ -16,16 +16,13 @@ pub enum ConfigError {
 
     #[error("Failed to parse configuration: {0}")]
     Parse(#[from] toml::de::Error),
-
-    #[error("Failed to read runner configuration (runner.toml): {0}")]
-    RunnerConfig(std::io::Error),
 }
 
 /// Main configuration - contains all sub-configurations.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub gitlab: GitLabConfig,
-    pub scaleway: ScalewayConfig,
+    pub parallels: ParallelsConfig,
     pub runner: RunnerConfig,
 }
 
@@ -41,59 +38,24 @@ pub struct GitLabConfig {
     pub tag_filter: Option<Vec<String>>,
 }
 
-/// Scaleway Instances configuration.
+/// Parallels Desktop configuration.
 #[derive(Debug, Deserialize, Clone)]
-pub struct ScalewayConfig {
-    /// Scaleway IAM API secret key
-    pub token: String,
-    /// Scaleway Project ID that owns the runner
-    pub project_id: String,
-    /// Availability Zone (e.g. "fr-par-1")
-    pub zone: String,
-    /// Instance type (e.g. "PRO2-XS", "PLAY2-PICO")
-    pub server_type: String,
-    /// Marketplace image label or local image UUID (e.g. "ubuntu_noble")
-    pub image: String,
-    /// Optional SSH public key injected via an AUTHORIZED_KEY tag
-    pub ssh_public_key: Option<String>,
-    /// Root volume size in GB (minimum 10)
-    #[serde(default = "default_volume_size")]
-    pub volume_size_gb: u32,
-    /// Root volume type: "sbs_volume" (default) or "l_ssd"
-    #[serde(default = "default_volume_type")]
-    pub volume_type: String,
-    /// Block Storage IOPS class: 5000 (default) or 15000. Only applies to
-    /// `sbs_volume`; ignored for `l_ssd`.
-    pub volume_iops: Option<u32>,
-}
-
-/// Default root volume size: 50 GB.
-pub fn default_volume_size() -> u32 {
-    50
-}
-
-/// Default root volume type: Block Storage.
-pub fn default_volume_type() -> String {
-    "sbs_volume".to_string()
+pub struct ParallelsConfig {
+    /// Name of the pre-configured Parallels Desktop VM
+    pub vm_name: String,
 }
 
 /// Runner-specific configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RunnerConfig {
-    /// Name of the server in Scaleway
+    /// Display name of the runner (used in logs and CSV)
     pub name: String,
-    /// Minimum runtime in minutes before the server can be deleted
+    /// Minimum runtime in minutes before the VM can be stopped
     #[serde(default = "default_min_lifetime")]
     pub min_lifetime_minutes: u32,
     /// Polling interval in seconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
-    /// Whether the runner should accept untagged jobs
-    #[serde(default = "default_run_untagged")]
-    pub run_untagged: bool,
-    /// Whether the runner should only run jobs on protected branches
-    #[serde(default = "default_protected")]
-    pub protected: bool,
 }
 
 /// Default value for minimum lifetime: 20 minutes
@@ -104,16 +66,6 @@ fn default_min_lifetime() -> u32 {
 /// Default value for polling interval: 30 seconds
 fn default_poll_interval() -> u64 {
     30
-}
-
-/// Default: accept untagged jobs (GitLab default behavior)
-fn default_run_untagged() -> bool {
-    true
-}
-
-/// Default: do not restrict to protected branches only
-fn default_protected() -> bool {
-    false
 }
 
 impl Config {
@@ -133,39 +85,11 @@ impl Config {
 
         info!("Configuration loaded successfully");
         info!("  GitLab URL: {}", config.gitlab.url);
-        info!(
-            "  Scaleway zone: {} (type: {}, volume: {} GB {}, iops: {})",
-            config.scaleway.zone,
-            config.scaleway.server_type,
-            config.scaleway.volume_size_gb,
-            config.scaleway.volume_type,
-            config
-                .scaleway
-                .volume_iops
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| "default".to_string())
-        );
+        info!("  Parallels VM: {}", config.parallels.vm_name);
         info!("  Runner name: {}", config.runner.name);
 
         Ok(config)
     }
-
-    // NOTE: `load_default()` was removed - not needed in this context,
-    // as the config path is explicitly defined in main.rs.
-}
-
-/// Loads the contents of runner.toml for cloud-init.
-///
-/// # Arguments
-/// * `path` - Path to the runner.toml file
-///
-/// # Returns
-/// The file contents as a string or an error
-pub fn load_runner_config<P: AsRef<Path>>(path: P) -> Result<String, ConfigError> {
-    let path = path.as_ref();
-    info!("Loading runner configuration from: {}", path.display());
-
-    std::fs::read_to_string(path).map_err(ConfigError::RunnerConfig)
 }
 
 #[cfg(test)]
@@ -179,41 +103,68 @@ mod tests {
     }
 
     #[test]
-    fn test_scaleway_defaults() {
+    fn test_parallels_config_parses() {
         let toml = r#"
-token = "scw-secret"
-project_id = "11111111-1111-1111-1111-111111111111"
-zone = "fr-par-1"
-server_type = "PRO2-XS"
-image = "ubuntu_noble"
+vm_name = "gitlab-runner"
 "#;
-        let config: super::ScalewayConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.volume_size_gb, 50);
-        assert_eq!(config.volume_type, "sbs_volume");
-        assert!(config.ssh_public_key.is_none());
-        assert!(config.volume_iops.is_none());
+        let config: ParallelsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.vm_name, "gitlab-runner");
     }
 
     #[test]
-    fn test_scaleway_overrides() {
+    fn test_runner_config_defaults() {
         let toml = r#"
-token = "scw-secret"
-project_id = "11111111-1111-1111-1111-111111111111"
-zone = "nl-ams-1"
-server_type = "DEV1-M"
-image = "ubuntu_noble"
-ssh_public_key = "ssh-ed25519 AAAA user@host"
-volume_size_gb = 120
-volume_type = "l_ssd"
-volume_iops = 15000
+name = "flexi-runner"
 "#;
-        let config: super::ScalewayConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.volume_size_gb, 120);
-        assert_eq!(config.volume_type, "l_ssd");
-        assert_eq!(config.volume_iops, Some(15000));
+        let config: RunnerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.min_lifetime_minutes, 20);
+        assert_eq!(config.poll_interval_seconds, 30);
+    }
+
+    #[test]
+    fn test_full_config_parses() {
+        let toml = r#"
+[gitlab]
+url = "https://gitlab.example.com"
+token = "glpat-xxxxxxxxxxxxxxxxxxxx"
+
+[parallels]
+vm_name = "gitlab-runner"
+
+[runner]
+name = "flexi-runner"
+min_lifetime_minutes = 45
+poll_interval_seconds = 15
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.gitlab.url, "https://gitlab.example.com");
+        assert_eq!(config.parallels.vm_name, "gitlab-runner");
+        assert_eq!(config.runner.name, "flexi-runner");
+        assert_eq!(config.runner.min_lifetime_minutes, 45);
+        assert_eq!(config.runner.poll_interval_seconds, 15);
+    }
+
+    #[test]
+    fn test_gitlab_tag_filter_optional() {
+        let toml = r#"
+url = "https://gitlab.example.com"
+token = "glpat-xxx"
+"#;
+        let config: GitLabConfig = toml::from_str(toml).unwrap();
+        assert!(config.tag_filter.is_none());
+    }
+
+    #[test]
+    fn test_gitlab_tag_filter_parses() {
+        let toml = r#"
+url = "https://gitlab.example.com"
+token = "glpat-xxx"
+tag_filter = ["macos", "arm64"]
+"#;
+        let config: GitLabConfig = toml::from_str(toml).unwrap();
         assert_eq!(
-            config.ssh_public_key.as_deref(),
-            Some("ssh-ed25519 AAAA user@host")
+            config.tag_filter.as_deref(),
+            Some(&["macos".to_string(), "arm64".to_string()][..])
         );
     }
 }

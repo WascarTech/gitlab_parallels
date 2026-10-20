@@ -1,24 +1,24 @@
-//! GitLab Runner Orchestrator for Scaleway.
+//! GitLab Runner Orchestrator for Parallels Desktop (macOS).
 //!
-//! Automatically creates Scaleway servers as GitLab runners when pipelines
-//! are pending and terminates them once the minimum lifetime has elapsed.
+//! Starts a pre-configured Parallels Desktop VM as a GitLab CI runner when
+//! pipelines are pending and stops it once the minimum lifetime has elapsed.
 //!
 //! # How it works
 //!
 //! 1. Polls the GitLab API for active pipelines (pending/running)
-//! 2. On active pipeline: Create Scaleway server (if not present)
-//! 3. On no active pipelines: Terminate server (after minimum runtime)
+//! 2. On active pipeline: Start the Parallels VM (if not running)
+//! 3. On no active pipelines: Stop the VM (after minimum runtime)
 //!
 //! # Configuration
 //!
-//! Expects `config/config.toml` with GitLab and Scaleway credentials.
-//! Expects `config/runner.toml` with GitLab Runner configuration.
+//! Expects `config/config.toml` with GitLab and Parallels VM settings.
+//! The VM must already exist in Parallels Desktop and be fully configured
+//! with a registered GitLab Runner.
 
-mod cloud_init;
 mod config;
 mod csv_log;
 mod gitlab;
-mod scaleway;
+mod parallels;
 mod state;
 
 use std::path::Path;
@@ -30,18 +30,14 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
-use crate::cloud_init::generate_cloud_init;
-use crate::config::{load_runner_config, Config};
+use crate::config::Config;
 use crate::csv_log::CsvLogger;
 use crate::gitlab::GitLabClient;
-use crate::scaleway::{server_volume_ids, ScalewayClient};
+use crate::parallels::ParallelsClient;
 use crate::state::{OrchestratorState, RunnerState};
 
 /// Default path for configuration.
 const CONFIG_PATH: &str = "config/config.toml";
-
-/// Default path for runner configuration.
-const RUNNER_CONFIG_PATH: &str = "config/runner.toml";
 
 /// Default path for persisted state.
 const STATE_PATH: &str = "config/state.json";
@@ -53,7 +49,7 @@ const LOG_DIR: &str = "logs";
 const CONFIG_EXAMPLE_PATH: &str = "config/config.example.toml";
 
 /// Content of the example configuration.
-const CONFIG_EXAMPLE_CONTENT: &str = r#"# GitLab Runner Orchestrator - Example Configuration
+const CONFIG_EXAMPLE_CONTENT: &str = r#"# GitLab Runner Orchestrator for Parallels Desktop - Example Configuration
 # Copy this file to config.toml and customize the values.
 
 [gitlab]
@@ -63,51 +59,33 @@ url = "https://gitlab.example.com"
 token = "glpat-xxxxxxxxxxxxxxxxxxxx"
 # Optional: only spin up a runner when a pending job has one of these tags.
 # Remove or leave empty to react to all pending jobs.
-# tag_filter = ["scaleway", "my-runner-tag"]
+# tag_filter = ["macos", "my-runner-tag"]
 
-[scaleway]
-# Scaleway IAM API secret key
-token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-# Scaleway Project ID that owns the runner
-project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-# Availability Zone (fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1)
-zone = "fr-par-1"
-# Instance type (e.g. PLAY2-PICO, DEV1-M, PRO2-XS, PRO2-S)
-server_type = "PRO2-XS"
-# Marketplace image label or local image UUID
-image = "ubuntu_noble"
-# Optional: SSH public key for debugging, injected via an AUTHORIZED_KEY tag
-# ssh_public_key = "ssh-ed25519 AAAA... user@host"
-# Root volume size in GB (minimum 10). 50+ recommended for CI caches.
-volume_size_gb = 50
-# Root volume type: "sbs_volume" (Block Storage, default) or "l_ssd" (local,
-# only on DEV1/GP1 instance types)
-volume_type = "sbs_volume"
-# Optional Block Storage IOPS class: 5000 (default) or 15000. Only applies to
-# "sbs_volume"; ignored for "l_ssd". 15K requires the instance type to have at
-# least 3 GiB/s of block bandwidth.
-# volume_iops = 15000
+[parallels]
+# Name of the pre-configured Parallels Desktop VM.
+# The VM must already exist and have a registered GitLab Runner inside.
+vm_name = "gitlab-runner"
 
 [runner]
-# Name of the server in Scaleway
+# Display name used in logs and CSV
 name = "flexi-runner"
-# Minimum runtime in minutes before the server can be deleted
+# Minimum runtime in minutes before the VM can be stopped
 min_lifetime_minutes = 20
 # Polling interval in seconds
 poll_interval_seconds = 30
 "#;
 
 /// Returns true if compiled in debug mode.
-/// In debug mode, the server is immediately deleted when no pipelines are active.
+/// In debug mode, the VM is immediately stopped when no pipelines are active.
 const fn is_debug_build() -> bool {
     cfg!(debug_assertions)
 }
 
-/// Returns true when an idle server may be terminated.
+/// Returns true when an idle VM may be stopped.
 ///
-/// Debug builds always terminate immediately; release builds wait until the
+/// Debug builds always stop immediately; release builds wait until the
 /// minimum lifetime has elapsed.
-fn should_terminate(uptime_minutes: u64, min_lifetime_minutes: u32, is_debug: bool) -> bool {
+fn should_stop(uptime_minutes: u64, min_lifetime_minutes: u32, is_debug: bool) -> bool {
     is_debug || uptime_minutes >= min_lifetime_minutes as u64
 }
 
@@ -160,47 +138,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("=== GitLab Runner Orchestrator ===");
+    info!("=== GitLab Runner Orchestrator for Parallels Desktop ===");
     info!("Logs are written to: {}/orchestrator.log", LOG_DIR);
     if is_debug_build() {
-        warn!("DEBUG BUILD: Server will be deleted immediately when no pipelines are active!");
+        warn!("DEBUG BUILD: VM will be stopped immediately when no pipelines are active!");
     }
     info!("Starting...");
 
     // Check if config directory exists
     if !Path::new("config").exists() {
         error!("Config directory 'config/' does not exist!");
-        error!("Please create config/config.toml and config/runner.toml");
+        error!("Please create config/config.toml");
         std::process::exit(1);
     }
 
     // Load configuration
     let config = Config::load(CONFIG_PATH).context("Error loading configuration")?;
 
-    // Load runner configuration
-    let runner_config =
-        load_runner_config(RUNNER_CONFIG_PATH).context("Error loading runner configuration")?;
-
     // Initialize CSV logger
     let csv_logger = CsvLogger::new(LOG_DIR).context("Error initializing CSV logger")?;
 
     // Create API clients
     let gitlab_client = GitLabClient::new(&config.gitlab);
-    let scaleway_client = ScalewayClient::new(&config.scaleway);
-
-    // Generate cloud-init template
-    let cloud_init = generate_cloud_init(
-        &runner_config,
-        config.runner.run_untagged,
-        config.runner.protected,
-    );
+    let parallels_client = ParallelsClient::new(&config.parallels);
 
     // Load orchestrator state with persistence
     let mut state =
         OrchestratorState::with_persistence(STATE_PATH).context("Error loading state")?;
 
-    // Verify that saved state matches Scaleway
-    verify_state_with_scaleway(&scaleway_client, &config.runner.name, &mut state).await?;
+    // Verify that saved state matches the actual VM state
+    verify_state_with_parallels(&parallels_client, &config.parallels.vm_name, &mut state).await?;
 
     // Polling interval (Debug: 5s, Release: from config)
     let poll_interval_secs = if is_debug_build() {
@@ -212,7 +179,7 @@ async fn main() -> Result<()> {
 
     info!("Starting polling loop (interval: {}s)", poll_interval_secs);
     info!(
-        "Minimum server runtime: {} minutes",
+        "Minimum VM runtime: {} minutes",
         config.runner.min_lifetime_minutes
     );
 
@@ -220,9 +187,8 @@ async fn main() -> Result<()> {
     loop {
         if let Err(e) = orchestration_tick(
             &gitlab_client,
-            &scaleway_client,
+            &parallels_client,
             &csv_logger,
-            &cloud_init,
             &config,
             &mut state,
         )
@@ -236,100 +202,68 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Verifies that the saved state matches Scaleway.
+/// Verifies that the saved state matches the actual VM state.
 ///
 /// Possible scenarios:
-/// - State says server exists, Scaleway too → OK, keep state
-/// - State says server exists, Scaleway doesn't → Clear state
-/// - State says no server, Scaleway has one → Update state (emergency)
-/// - Both say no server → OK
-async fn verify_state_with_scaleway(
-    scaleway_client: &ScalewayClient,
-    server_name: &str,
+/// - State says VM is running, Parallels says running → OK, keep state
+/// - State says VM is running, Parallels says stopped → Clear state
+/// - State says no VM, Parallels says running → Update state (emergency)
+/// - Both say stopped → OK
+async fn verify_state_with_parallels(
+    parallels_client: &ParallelsClient,
+    vm_name: &str,
     state: &mut OrchestratorState,
 ) -> Result<()> {
-    info!("Verifying state with Scaleway API...");
+    info!("Verifying state with Parallels Desktop...");
 
-    let scaleway_server = scaleway_client.find_server_by_name(server_name).await?;
+    let vm_running = parallels_client.is_running().await?;
 
-    match (&state.runner, scaleway_server) {
-        // State and Scaleway match - server exists
-        (Some(runner), Some(server)) if runner.server_id == server.id => {
+    match (&state.runner, vm_running) {
+        // State and Parallels match - VM is running
+        (Some(runner), true) => {
             info!(
-                "State verified: Server {} (ID: {}) exists, running for {} minutes",
-                server.name,
-                server.id,
+                "State verified: VM {} is running for {} minutes",
+                runner.vm_name,
                 runner.uptime_minutes()
             );
         }
 
-        // State says server exists, but Scaleway doesn't know it anymore
-        (Some(runner), None) => {
+        // State says VM is running, but it's actually stopped
+        (Some(runner), false) => {
             warn!(
-                "State inconsistency: Server {} (ID: {}) no longer exists at Scaleway!",
-                runner.server_name, runner.server_id
+                "State inconsistency: VM {} was running but is now stopped!",
+                runner.vm_name
             );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
-            state.set_pending_volumes(failed);
             warn!("Clearing state...");
             state.clear_runner();
         }
 
-        // State says server exists, but with different ID (very unlikely)
-        (Some(runner), Some(server)) => {
+        // State says no VM, but it's actually running (emergency recovery)
+        (None, true) => {
             warn!(
-                "State inconsistency: State knows server ID {}, Scaleway has ID {}!",
-                runner.server_id, server.id
+                "VM {} is running but not in state - adopting (start time unknown)",
+                vm_name
             );
-            let failed = scaleway_client.delete_volumes(&runner.volume_ids).await;
-            state.set_pending_volumes(failed);
-            warn!("Updating state with Scaleway data (creation time unknown)...");
-            let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
+            state.set_runner(RunnerState::new(vm_name.to_string()));
         }
 
-        // State says no server, but Scaleway has one (emergency recovery)
-        (None, Some(server)) => {
-            warn!(
-                "Orphaned server found: {} (ID: {}) - not in state!",
-                server.name, server.id
-            );
-            warn!("Adding to state (creation time unknown)...");
-            let volume_ids = server_volume_ids(&server);
-            state.set_runner(RunnerState::new(server.id, server.name, volume_ids));
-        }
-
-        // All OK - no server
-        (None, None) => {
-            info!("No server active - state is consistent");
+        // All OK - VM is stopped
+        (None, false) => {
+            info!("No VM running - state is consistent");
         }
     }
 
     Ok(())
 }
 
-/// Retries deletion of volumes from previous failed attempts.
-async fn retry_pending_volumes(scaleway_client: &ScalewayClient, state: &mut OrchestratorState) {
-    let pending = state.pending_volume_ids();
-    if pending.is_empty() {
-        return;
-    }
-    info!("Retrying deletion of {} pending volume(s)", pending.len());
-    let failed = scaleway_client.delete_volumes(&pending).await;
-    state.set_pending_volumes(failed);
-}
-
 /// One pass of the orchestration logic.
 async fn orchestration_tick(
     gitlab_client: &GitLabClient,
-    scaleway_client: &ScalewayClient,
+    parallels_client: &ParallelsClient,
     csv_logger: &CsvLogger,
-    cloud_init: &str,
     config: &Config,
     state: &mut OrchestratorState,
 ) -> Result<()> {
-    retry_pending_volumes(scaleway_client, state).await;
-
     // Query GitLab for active jobs (filtered by tag if configured)
     let active_jobs = gitlab_client
         .find_active_jobs(config.gitlab.tag_filter.as_deref())
@@ -337,30 +271,29 @@ async fn orchestration_tick(
     let has_active = !active_jobs.is_empty();
 
     if has_active {
-        // There are active jobs - ensure server exists
+        // There are active jobs - ensure VM is running
         if !state.has_runner() {
-            // No server present - create one
+            // No VM running - start one
             let first_job = &active_jobs[0];
             info!(
                 "Active job found: {} (ID: {}) in {}",
                 first_job.job.status, first_job.job.id, first_job.project.path_with_namespace
             );
 
-            create_runner(
-                scaleway_client,
+            start_runner(
+                parallels_client,
                 csv_logger,
-                cloud_init,
-                config,
+                &config.parallels.vm_name,
                 state,
                 &first_job.project.path_with_namespace,
                 first_job.job.id,
             )
             .await?;
         } else {
-            // Server is already running
+            // VM is already running
             if let Some(uptime) = state.runner_uptime() {
                 info!(
-                    "Server running ({}min), {} active job(s)",
+                    "VM running ({}min), {} active job(s)",
                     uptime,
                     active_jobs.len()
                 );
@@ -369,48 +302,46 @@ async fn orchestration_tick(
     } else {
         // No active jobs
         if state.has_runner() {
-            // Server is running, but no jobs anymore - check if we should delete
-            maybe_delete_runner(scaleway_client, csv_logger, config, state).await?;
+            // VM is running, but no jobs anymore - check if we should stop
+            maybe_stop_runner(parallels_client, csv_logger, config, state).await?;
         } else {
-            info!("No active jobs, no server active - waiting...");
+            info!("No active jobs, no VM running - waiting...");
         }
     }
 
     Ok(())
 }
 
-/// Creates a new runner server.
-async fn create_runner(
-    scaleway_client: &ScalewayClient,
+/// Starts the runner VM.
+async fn start_runner(
+    parallels_client: &ParallelsClient,
     csv_logger: &CsvLogger,
-    cloud_init: &str,
-    config: &Config,
+    vm_name: &str,
     state: &mut OrchestratorState,
     project: &str,
     pipeline_id: u64,
 ) -> Result<()> {
-    info!("Creating new runner server...");
+    info!("Starting runner VM...");
 
-    let server = scaleway_client
-        .create_server(&config.runner.name, cloud_init)
+    parallels_client
+        .start()
         .await
-        .context("Error creating server")?;
+        .context("Error starting VM")?;
 
-    let volume_ids = server_volume_ids(&server);
-    let runner_state = RunnerState::new(server.id.clone(), server.name.clone(), volume_ids);
+    let runner_state = RunnerState::new(vm_name.to_string());
     state.set_runner(runner_state);
 
-    if let Err(e) = csv_logger.log_start(&server.id, project, pipeline_id, "pipeline_pending") {
+    if let Err(e) = csv_logger.log_start(vm_name, project, pipeline_id, "pipeline_pending") {
         warn!("Error in CSV logging: {}", e);
     }
 
-    info!("Runner server created and ready");
+    info!("Runner VM started and ready");
     Ok(())
 }
 
-/// Checks if the server should be deleted and performs deletion if so.
-async fn maybe_delete_runner(
-    scaleway_client: &ScalewayClient,
+/// Checks if the VM should be stopped and performs the stop if so.
+async fn maybe_stop_runner(
+    parallels_client: &ParallelsClient,
     csv_logger: &CsvLogger,
     config: &Config,
     state: &mut OrchestratorState,
@@ -423,9 +354,9 @@ async fn maybe_delete_runner(
     let uptime = runner.uptime_minutes();
     let min_lifetime = config.runner.min_lifetime_minutes;
 
-    if !should_terminate(uptime, min_lifetime, is_debug_build()) {
+    if !should_stop(uptime, min_lifetime, is_debug_build()) {
         info!(
-            "Server running for {}min (minimum {}min), no pipelines active - waiting...",
+            "VM running for {}min (minimum {}min), no pipelines active - waiting...",
             uptime, min_lifetime
         );
         return Ok(());
@@ -433,20 +364,20 @@ async fn maybe_delete_runner(
 
     let reason = if is_debug_build() {
         info!(
-            "[DEBUG] Server running for {}min - deleting immediately (no pipelines active)",
+            "[DEBUG] VM running for {}min - stopping immediately (no pipelines active)",
             uptime
         );
-        "debug_immediate_delete"
+        "debug_immediate_stop"
     } else {
         "all_pipelines_done"
     };
 
-    delete_runner(scaleway_client, csv_logger, state, reason).await
+    stop_runner(parallels_client, csv_logger, state, reason).await
 }
 
-/// Terminates the runner server and removes its volumes.
-async fn delete_runner(
-    scaleway_client: &ScalewayClient,
+/// Stops the runner VM.
+async fn stop_runner(
+    parallels_client: &ParallelsClient,
     csv_logger: &CsvLogger,
     state: &mut OrchestratorState,
     reason: &str,
@@ -456,29 +387,20 @@ async fn delete_runner(
         None => return Ok(()),
     };
 
-    let server_id = runner.server_id.clone();
-    let volume_ids = runner.volume_ids.clone();
+    let vm_name = runner.vm_name.clone();
     let uptime = runner.uptime_minutes();
 
-    info!("Deleting runner server (reason: {})", reason);
+    info!("Stopping runner VM (reason: {})", reason);
 
-    scaleway_client
-        .terminate_server(&server_id)
-        .await
-        .context("Error terminating server")?;
+    parallels_client.stop().await.context("Error stopping VM")?;
 
-    let mut to_delete = volume_ids;
-    to_delete.extend(state.pending_volume_ids());
-    let failed = scaleway_client.delete_volumes(&to_delete).await;
-    state.set_pending_volumes(failed);
-
-    if let Err(e) = csv_logger.log_stop(&server_id, reason, uptime) {
+    if let Err(e) = csv_logger.log_stop(&vm_name, reason, uptime) {
         warn!("Error in CSV logging: {}", e);
     }
 
     state.clear_runner();
 
-    info!("Runner server deleted (runtime: {} minutes)", uptime);
+    info!("Runner VM stopped (runtime: {} minutes)", uptime);
     Ok(())
 }
 
@@ -487,19 +409,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_should_terminate_debug_always() {
-        assert!(should_terminate(0, 20, true));
-        assert!(should_terminate(1, 999, true));
+    fn test_should_stop_debug_always() {
+        assert!(should_stop(0, 20, true));
+        assert!(should_stop(1, 999, true));
     }
 
     #[test]
-    fn test_should_terminate_before_min_lifetime() {
-        assert!(!should_terminate(19, 20, false));
+    fn test_should_stop_before_min_lifetime() {
+        assert!(!should_stop(19, 20, false));
     }
 
     #[test]
-    fn test_should_terminate_at_or_after_min_lifetime() {
-        assert!(should_terminate(20, 20, false));
-        assert!(should_terminate(65, 20, false));
+    fn test_should_stop_at_or_after_min_lifetime() {
+        assert!(should_stop(20, 20, false));
+        assert!(should_stop(65, 20, false));
     }
 }

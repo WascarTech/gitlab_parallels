@@ -1,5 +1,0 @@
-services:
-  scaleway-starter:
-    build: .
-    volumes:
-      - ./config:/app/config

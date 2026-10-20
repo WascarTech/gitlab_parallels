@@ -1,7 +1,7 @@
-//! Server state management.
+//! VM state management.
 //!
-//! Manages the state of the current runner, especially
-//! the creation time for the deletion logic.
+//! Manages the state of the current runner VM, especially
+//! the start time for the minimum-lifetime logic.
 //!
 //! The state is persisted to `config/state.json` to survive
 //! program restarts.
@@ -23,40 +23,30 @@ pub enum StateError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// State of an active runner.
+/// State of an active runner VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerState {
-    /// Scaleway server UUID
-    pub server_id: String,
-    /// Server name
-    pub server_name: String,
-    /// Creation timestamp
-    pub created_at: DateTime<Utc>,
-    /// IDs of volumes attached at creation, deleted after termination
-    #[serde(default)]
-    pub volume_ids: Vec<String>,
+    /// Name of the Parallels VM
+    pub vm_name: String,
+    /// Start timestamp
+    pub started_at: DateTime<Utc>,
 }
 
 impl RunnerState {
     /// Creates a new runner state with current timestamp.
-    pub fn new(server_id: String, server_name: String, volume_ids: Vec<String>) -> Self {
-        let created_at = Utc::now();
-        info!(
-            "Runner state created: Server {} (ID: {})",
-            server_name, server_id
-        );
+    pub fn new(vm_name: String) -> Self {
+        let started_at = Utc::now();
+        info!("Runner state created: VM {}", vm_name);
 
         Self {
-            server_id,
-            server_name,
-            created_at,
-            volume_ids,
+            vm_name,
+            started_at,
         }
     }
 
-    /// Calculates how long the server has been running (in minutes).
+    /// Calculates how long the VM has been running (in minutes).
     pub fn uptime_minutes(&self) -> u64 {
-        let duration = Utc::now().signed_duration_since(self.created_at);
+        let duration = Utc::now().signed_duration_since(self.started_at);
         duration.num_minutes().max(0) as u64
     }
 }
@@ -65,8 +55,6 @@ impl RunnerState {
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedState {
     runner: Option<RunnerState>,
-    #[serde(default)]
-    pending_volume_ids: Vec<String>,
 }
 
 /// Orchestrator state - manages the entire application state.
@@ -76,8 +64,6 @@ pub struct OrchestratorState {
     pub runner: Option<RunnerState>,
     /// Path to the state file
     state_file_path: Option<std::path::PathBuf>,
-    /// Volume IDs whose deletion failed and that must be retried
-    pending_volume_ids: Vec<String>,
 }
 
 impl OrchestratorState {
@@ -87,7 +73,6 @@ impl OrchestratorState {
         Self {
             runner: None,
             state_file_path: None,
-            pending_volume_ids: Vec::new(),
         }
     }
 
@@ -99,7 +84,6 @@ impl OrchestratorState {
         let mut state = Self {
             runner: None,
             state_file_path: Some(path.clone()),
-            pending_volume_ids: Vec::new(),
         };
 
         // Try to load state
@@ -124,7 +108,6 @@ impl OrchestratorState {
         let content = std::fs::read_to_string(path)?;
         let persisted: PersistedState = serde_json::from_str(&content)?;
         self.runner = persisted.runner;
-        self.pending_volume_ids = persisted.pending_volume_ids;
         Ok(())
     }
 
@@ -133,7 +116,6 @@ impl OrchestratorState {
         if let Some(ref path) = self.state_file_path {
             let persisted = PersistedState {
                 runner: self.runner.clone(),
-                pending_volume_ids: self.pending_volume_ids.clone(),
             };
             let content = serde_json::to_string_pretty(&persisted)?;
             std::fs::write(path, content)?;
@@ -144,10 +126,7 @@ impl OrchestratorState {
 
     /// Sets the active runner and saves the state.
     pub fn set_runner(&mut self, state: RunnerState) {
-        info!(
-            "Active runner set: {} (ID: {})",
-            state.server_name, state.server_id
-        );
+        info!("Active runner set: VM {}", state.vm_name);
         self.runner = Some(state);
 
         if let Err(e) = self.save_to_file() {
@@ -159,32 +138,13 @@ impl OrchestratorState {
     pub fn clear_runner(&mut self) {
         if let Some(ref runner) = self.runner {
             info!(
-                "Runner removed: {} (runtime: {} minutes)",
-                runner.server_name,
+                "Runner removed: VM {} (runtime: {} minutes)",
+                runner.vm_name,
                 runner.uptime_minutes()
             );
         }
         self.runner = None;
 
-        if let Err(e) = self.save_to_file() {
-            warn!("Error saving state: {}", e);
-        }
-    }
-
-    /// Returns a copy of the volume IDs still awaiting deletion.
-    pub fn pending_volume_ids(&self) -> Vec<String> {
-        self.pending_volume_ids.clone()
-    }
-
-    /// Replaces the pending volume list, de-duplicating and persisting it.
-    pub fn set_pending_volumes(&mut self, volume_ids: Vec<String>) {
-        let mut deduped: Vec<String> = Vec::new();
-        for id in volume_ids {
-            if !deduped.contains(&id) {
-                deduped.push(id);
-            }
-        }
-        self.pending_volume_ids = deduped;
         if let Err(e) = self.save_to_file() {
             warn!("Error saving state: {}", e);
         }
@@ -207,15 +167,9 @@ mod tests {
 
     #[test]
     fn test_runner_state_creation() {
-        let state = RunnerState::new(
-            "server-uuid".to_string(),
-            "test-runner".to_string(),
-            vec!["vol-1".to_string()],
-        );
+        let state = RunnerState::new("gitlab-runner".to_string());
 
-        assert_eq!(state.server_id, "server-uuid");
-        assert_eq!(state.server_name, "test-runner");
-        assert_eq!(state.volume_ids, vec!["vol-1".to_string()]);
+        assert_eq!(state.vm_name, "gitlab-runner");
         assert!(state.uptime_minutes() < 1);
     }
 
@@ -224,7 +178,7 @@ mod tests {
         let mut state = OrchestratorState::new();
         assert!(!state.has_runner());
 
-        let runner = RunnerState::new("server-uuid".to_string(), "test-runner".to_string(), vec![]);
+        let runner = RunnerState::new("gitlab-runner".to_string());
         state.set_runner(runner);
 
         assert!(state.has_runner());
@@ -235,42 +189,17 @@ mod tests {
 
     #[test]
     fn test_state_serialization() {
-        let runner = RunnerState::new(
-            "server-uuid".to_string(),
-            "test-runner".to_string(),
-            vec!["vol-1".to_string()],
-        );
+        let runner = RunnerState::new("gitlab-runner".to_string());
         let json = serde_json::to_string(&runner).unwrap();
         let restored: RunnerState = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.server_id, "server-uuid");
-        assert_eq!(restored.server_name, "test-runner");
-        assert_eq!(restored.volume_ids, vec!["vol-1".to_string()]);
+        assert_eq!(restored.vm_name, "gitlab-runner");
     }
 
     #[test]
-    fn test_pending_volumes_round_trip() {
-        let mut state = OrchestratorState::new();
-        state.set_pending_volumes(vec!["vol-a".into(), "vol-b".into(), "vol-a".into()]);
-        assert_eq!(state.pending_volume_ids(), vec!["vol-a", "vol-b"]);
-    }
-
-    #[test]
-    fn test_pending_volumes_saved_to_file() {
+    fn test_persisted_state_round_trip() {
         let json = r#"{"runner": null}"#;
         let p: PersistedState = serde_json::from_str(json).unwrap();
-        assert!(p.pending_volume_ids.is_empty());
-    }
-
-    #[test]
-    fn test_state_without_volume_ids_still_loads() {
-        let json = r#"{
-            "server_id": "server-uuid",
-            "server_name": "test-runner",
-            "created_at": "2026-01-14T10:30:00Z"
-        }"#;
-        let restored: RunnerState = serde_json::from_str(json).unwrap();
-        assert_eq!(restored.server_id, "server-uuid");
-        assert!(restored.volume_ids.is_empty());
+        assert!(p.runner.is_none());
     }
 }

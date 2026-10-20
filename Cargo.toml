@@ -1,8 +1,8 @@
 [package]
-name = "gitlab_scaleway"
-version = "0.3.0"
+name = "gitlab_parallels"
+version = "0.4.0"
 edition = "2021"
-description = "Automatic Scaleway server provisioning for GitLab CI runners"
+description = "Automatic Parallels Desktop VM management for GitLab CI runners on macOS"
 license = "MIT"
 authors = ["Maximilian Kutschka"]
 
@@ -16,6 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.22"
 thiserror = "2.0"
 anyhow = "1.0"
