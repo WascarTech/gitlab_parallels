@@ -1,16 +1,16 @@
-# GitLab Runner Orchestrator for Scaleway
+# GitLab Runner Orchestrator for Parallels Desktop (macOS)
 
-Automatic provisioning of Scaleway Instances as GitLab CI runners - **pay only when you need it**.
+Automatic start/stop of a pre-configured Parallels Desktop VM as a GitLab CI runner — **pay only when you need it** (no cloud bills, just local compute).
 
 ## Features
 
-- **Automatic server creation** when pipelines are pending/running
-- **Cost-aware deletion** - the instance is terminated once the minimum lifetime has elapsed and no jobs remain
-- **Configurable root volume** - sized for Docker layer and build caches (default 50 GB)
-- **Polls all projects** - one runner for the entire GitLab instance
-- **State persistence** - survives restarts without data loss
-- **CSV logging** - documents all server starts/stops with reason and duration
-- **Rotating log files** - daily rotation
+- **Automatic VM start** when pipelines are pending/running
+- **Cost-aware stop** — the VM is stopped once the minimum lifetime has elapsed and no jobs remain
+- **Polls all projects** — one runner for the entire GitLab instance
+- **State persistence** — survives restarts without data loss
+- **CSV logging** — documents all VM starts/stops with reason and duration
+- **Rotating log files** — daily rotation
+- **Native macOS** — no Docker, no cloud API, just `prlctl`
 
 ## Architecture
 
@@ -20,18 +20,15 @@ flowchart TB
         Poll[Polling Loop]
         Poll --> FetchProjects[GitLab: Fetch all projects]
         FetchProjects --> CheckPipelines[Per project: Pending/Running pipelines?]
-        CheckPipelines -->|Yes + No server| LogStart[CSV: Log reason]
-        LogStart --> CreateServer[Scaleway: Create stopped instance]
-        CreateServer --> CloudInit[Scaleway: Apply cloud-init]
-        CloudInit --> PowerOn[Scaleway: Power on]
-        CheckPipelines -->|No everywhere + Server exists| CheckDelete[Check min lifetime]
-        CheckDelete -->|Elapsed| LogStop[CSV: Log usage]
-        LogStop --> Terminate[Scaleway: Terminate + delete volumes]
+        CheckPipelines -->|Yes + VM stopped| LogStart[CSV: Log reason]
+        LogStart --> StartVM[Parallels: prlctl start]
+        CheckPipelines -->|No everywhere + VM running| CheckStop[Check min lifetime]
+        CheckStop -->|Elapsed| LogStop[CSV: Log usage]
+        LogStop --> StopVM[Parallels: prlctl stop]
     end
 
     subgraph config [Config]
         ConfigToml[config/config.toml]
-        RunnerToml[config/runner.toml]
     end
 
     subgraph logs [Logging]
@@ -40,10 +37,17 @@ flowchart TB
     end
 
     ConfigToml --> main
-    RunnerToml --> CloudInit
     main --> CSV
     main --> LogFile
 ```
+
+## Prerequisites
+
+- **macOS** with [Parallels Desktop](https://www.parallels.com/) installed
+- A **pre-configured VM** in Parallels Desktop with:
+  - A registered GitLab Runner inside (the runner must be able to pick up jobs)
+  - The VM name must match what you configure in `config/config.toml`
+- Rust toolchain (`cargo`) to build the orchestrator
 
 ## Quick Start
 
@@ -59,49 +63,46 @@ On first start, `config/config.example.toml` is automatically created. Copy and 
 
 ```bash
 cp config/config.example.toml config/config.toml
-# Edit config/config.toml with your Scaleway and GitLab credentials
+# Edit config/config.toml with your GitLab credentials and VM name
 ```
 
-You need a Scaleway IAM API secret key and the Project ID that should own the runners. See the [Scaleway IAM documentation](https://www.scaleway.com/en/docs/iam/how-to/create-api-keys/) for creating a key.
+### 3. Prepare your Parallels VM
 
-### 3. Create runner configuration
+Create a VM in Parallels Desktop and configure it with a GitLab Runner:
 
-Create `config/runner.toml` with your GitLab Runner configuration.
-You can register the GitLab Runner with the following command:
+1. Install the GitLab Runner inside the VM:
+   ```bash
+   # Example for Ubuntu/Debian inside the VM:
+   curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" | sudo bash
+   sudo apt-get install gitlab-runner
+   ```
 
-```bash
-docker run -it -v /var/run/docker.sock:/var/run/docker.sock -v ./config:/etc/gitlab-runner gitlab/gitlab-runner:latest register --url https://gitlab.example.com --token YOUR_TOKEN
-```
+2. Register the runner:
+   ```bash
+   sudo gitlab-runner register \
+     --url https://gitlab.example.com \
+     --token YOUR_REGISTRATION_TOKEN \
+     --executor shell \
+     --description "parallels-runner"
+   ```
 
-**IMPORTANT:**
-Under `[runners.docker]` there is a `pull_policy` setting.
-Set it to:
+3. Make sure the runner service is enabled and will start automatically when the VM boots:
+   ```bash
+   sudo gitlab-runner install
+   sudo gitlab-runner start
+   ```
 
-```toml
-pull_policy = ["if-not-present"]
-```
+4. **Stop the VM** — the orchestrator will start it when needed.
 
-Otherwise the runner will do too many `docker image pull` requests and your IP will be banned!
+5. Note the VM name (visible in Parallels Desktop or via `prlctl list -a`).
 
-### 4. Start
+### 4. Start the orchestrator
 
 ```bash
 cargo run --release
 # or
-./target/release/gitlab_scaleway
+./target/release/gitlab_parallels
 ```
-
-### Docker image
-
-A prebuilt image is published to GitHub Container Registry on every push to `master`:
-
-```bash
-docker run -d --restart always \
-  -v ./config:/app/config \
-  ghcr.io/wascartech/gitlab_scaleway:latest
-```
-
-Version tags (`v1.2.3`) publish `:1.2.3` and `:1.2` tags as well.
 
 ## Configuration
 
@@ -111,78 +112,96 @@ Version tags (`v1.2.3`) publish `:1.2.3` and `:1.2` tags as well.
 [gitlab]
 url = "https://gitlab.example.com"
 token = "glpat-xxxxxxxxxxxxxxxxxxxx"  # read_api scope
+# tag_filter = ["macos", "arm64"]     # optional: only react to jobs with these tags
 
-[scaleway]
-token = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"   # IAM API secret key
-project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-zone = "fr-par-1"                # fr-par-1/2/3, nl-ams-1/2/3, pl-waw-1/2/3, it-mil-1
-server_type = "PRO2-XS"
-image = "ubuntu_noble"
-ssh_public_key = "ssh-ed25519 AAAA... user@host"  # optional
-volume_size_gb = 50              # minimum 10
-volume_type = "sbs_volume"       # or "l_ssd" on DEV1/GP1 types
-volume_iops = 15000              # optional: 5000 (default) or 15000, sbs_volume only
+[parallels]
+vm_name = "gitlab-runner"             # name of your pre-configured Parallels VM
 
 [runner]
-name = "flexi-runner"
-min_lifetime_minutes = 20
-poll_interval_seconds = 30
-# Whether the runner should accept jobs without tags
-run_untagged = true
-# Whether the runner should only run jobs on protected branches
-protected = false
+name = "flexi-runner"                 # display name for logs/CSV
+min_lifetime_minutes = 20             # minimum runtime before the VM can be stopped
+poll_interval_seconds = 30            # how often to check GitLab for active jobs
 ```
 
-### Runner Options
+### How it works
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `run_untagged` | boolean | `true` | If `true`, the runner will accept jobs that don't have any tags. If `false`, the runner will only accept jobs that match its tags. |
-| `protected` | boolean | `false` | If `true`, the runner will only run jobs on protected branches. If `false`, the runner will run jobs on all branches. |
+1. The orchestrator polls your GitLab instance every `poll_interval_seconds`.
+2. When a pending or running job is found, it starts the VM via `prlctl start <vm_name>`.
+3. The GitLab Runner inside the VM picks up the job.
+4. When no jobs remain active and the VM has been running for at least `min_lifetime_minutes`, the orchestrator stops the VM via `prlctl stop <vm_name>`.
 
-### Storage
+### Listing your VMs
 
-Scaleway's OS image default root volume is only about 10 GB, which is too small for Docker layer caches and build caches. `volume_size_gb` controls the root volume size; **50 GB or more is recommended** for CI workloads.
+To find the exact name of your VM:
 
-`volume_type` selects the storage backend:
-
-- `sbs_volume` (default) - network Block Storage. Works with all current instance ranges. Terminating an instance only *detaches* a `sbs_volume`, so the orchestrator waits until the instance is fully deleted and the volume reports `available`, then deletes it through the Block Storage API. Deletes are retried, and any volume that still cannot be removed is recorded in `config/state.json` and retried on every poll and at startup.
-- `l_ssd` - local SSD, only available on Development (DEV1) and first-generation General Purpose (GP1) instance types. It is deleted automatically when the instance is terminated.
-
-`volume_iops` selects the Block Storage performance class for `sbs_volume` roots: `5000` (default) or `15000` IOPS. The Instance API cannot set IOPS at creation time, so the orchestrator applies it through the Block Storage API once the instance is created. 15K requires the instance type to expose at least **3 GiB/s of block bandwidth**; otherwise 5000 IOPS is used. The setting is ignored for `l_ssd`.
-
-### SSH access
-
-If `ssh_public_key` is set, the orchestrator attaches it to the instance using an `AUTHORIZED_KEY` tag, matching how Scaleway injects per-instance keys. Leave it unset to rely solely on account-level keys.
+```bash
+prlctl list -a
+```
 
 ## Debug vs Release
 
 | Feature          | Debug     | Release                          |
 | ---------------- | --------- | -------------------------------- |
 | Polling interval | 5s        | 30s (from config)                |
-| Server deletion  | Immediate | After min. lifetime              |
-
-## Billing
-
-Scaleway CPU Instances are billed **per hour while powered on**, with a minimum of 60 minutes per start/stop period. Storage volumes and flexible IPv4 addresses are billed separately and continue while the instance exists.
-
-Because of the 60-minute minimum block, terminating an idle instance at `min_lifetime_minutes = 20` costs the same as waiting until 55 minutes. Setting `min_lifetime_minutes = 60` keeps the instance available for the full paid block to absorb follow-up jobs. The orchestrator terminates the instance and deletes its volumes once no jobs remain and the minimum lifetime has elapsed. Cleanup waits for the termination to complete and for Block Storage volumes to detach before deleting them, retrying failures across poll cycles so no billable volume is leaked.
+| VM stop          | Immediate | After min. lifetime              |
 
 ## Logs
 
-- `logs/orchestrator.log` - Detailed logs (daily rotation)
-- `logs/runner_usage.csv` - Server usage documentation
+- `logs/orchestrator.log` — Detailed logs (daily rotation)
+- `logs/runner_usage.csv` — VM usage documentation
 
 ### CSV Format
 
 ```csv
-timestamp,event,server_id,project,pipeline_id,reason,duration_minutes
-2026-01-14T10:30:00Z,START,2e0394ea-120c-4a15-ad78-053f844d486c,mygroup/myproject,9876,pipeline_pending,
-2026-01-14T11:15:00Z,STOP,2e0394ea-120c-4a15-ad78-053f844d486c,,,all_pipelines_done,45
+timestamp,event,vm_name,project,pipeline_id,reason,duration_minutes
+2026-01-14T10:30:00Z,START,gitlab-runner,mygroup/myproject,9876,pipeline_pending,
+2026-01-14T11:15:00Z,STOP,gitlab-runner,,,all_pipelines_done,45
 ```
 
-## Migrating from the Hetzner version
+## Running as a background service (optional)
 
-- Rewrite `config/config.toml`: replace the `[hetzner]` section with `[scaleway]` (see above).
-- Delete any existing `config/state.json`. The old numeric server ID is not compatible; the orchestrator ignores an unreadable state file and starts fresh.
-- `config/runner.toml` is unchanged.
+To keep the orchestrator running in the background on macOS, create a LaunchAgent:
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+```
+
+Create `~/Library/LaunchAgents/tech.wascar.gitlab-parallels.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>tech.wascar.gitlab-parallels</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/gitlab_parallels/target/release/gitlab_parallels</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/gitlab_parallels</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/path/to/gitlab_parallels/logs/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/gitlab_parallels/logs/stderr.log</string>
+</dict>
+</plist>
+```
+
+Then load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/tech.wascar.gitlab-parallels.plist
+```
+
+## Migrating from the Scaleway version
+
+- Rewrite `config/config.toml`: replace the `[scaleway]` section with `[parallels]` (just `vm_name`).
+- Delete any existing `config/state.json`. The old Scaleway server IDs are not compatible; the orchestrator ignores an unreadable state file and starts fresh.
+- Remove `config/runner.toml` — it is no longer needed. The GitLab Runner is configured inside the VM itself.
+- The Docker stack (`Dockerfile`, `docker-compose.yml`) has been removed. This project is now a native macOS binary.

@@ -1,6 +1,6 @@
 //! CSV logging module for runner usage documentation.
 //!
-//! Logs all server starts and stops with relevant metadata to a CSV file.
+//! Logs all VM starts and stops with relevant metadata to a CSV file.
 
 use chrono::{DateTime, Utc};
 use std::fs::{File, OpenOptions};
@@ -19,9 +19,9 @@ pub enum CsvLogError {
 /// Event type for the CSV log.
 #[derive(Debug, Clone, Copy)]
 pub enum LogEvent {
-    /// Server was started
+    /// VM was started
     Start,
-    /// Server was stopped
+    /// VM was stopped
     Stop,
 }
 
@@ -41,8 +41,8 @@ pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     /// Type of event (START/STOP)
     pub event: LogEvent,
-    /// Scaleway server UUID
-    pub server_id: Option<String>,
+    /// Name of the Parallels VM
+    pub vm_name: Option<String>,
     /// GitLab project (path_with_namespace)
     pub project: Option<String>,
     /// Pipeline ID that triggered the start
@@ -96,7 +96,7 @@ impl CsvLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "timestamp,event,server_id,project,pipeline_id,reason,duration_minutes"
+            "timestamp,event,vm_name,project,pipeline_id,reason,duration_minutes"
         )?;
         writer.flush()?;
         Ok(())
@@ -119,7 +119,7 @@ impl CsvLogger {
             "{},{},{},{},{},{},{}",
             entry.timestamp.to_rfc3339(),
             entry.event,
-            entry.server_id.as_deref().unwrap_or_default(),
+            entry.vm_name.as_deref().unwrap_or_default(),
             entry.project.as_deref().unwrap_or(""),
             entry
                 .pipeline_id
@@ -140,10 +140,10 @@ impl CsvLogger {
         Ok(())
     }
 
-    /// Helper method: Logs a server start.
+    /// Helper method: Logs a VM start.
     pub fn log_start(
         &self,
-        server_id: &str,
+        vm_name: &str,
         project: &str,
         pipeline_id: u64,
         reason: &str,
@@ -151,7 +151,7 @@ impl CsvLogger {
         let entry = LogEntry {
             timestamp: Utc::now(),
             event: LogEvent::Start,
-            server_id: Some(server_id.to_string()),
+            vm_name: Some(vm_name.to_string()),
             project: Some(project.to_string()),
             pipeline_id: Some(pipeline_id),
             reason: reason.to_string(),
@@ -160,17 +160,17 @@ impl CsvLogger {
         self.log(&entry)
     }
 
-    /// Helper method: Logs a server stop.
+    /// Helper method: Logs a VM stop.
     pub fn log_stop(
         &self,
-        server_id: &str,
+        vm_name: &str,
         reason: &str,
         duration_minutes: u64,
     ) -> Result<(), CsvLogError> {
         let entry = LogEntry {
             timestamp: Utc::now(),
             event: LogEvent::Stop,
-            server_id: Some(server_id.to_string()),
+            vm_name: Some(vm_name.to_string()),
             project: None,
             pipeline_id: None,
             reason: reason.to_string(),
@@ -201,22 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn test_log_entry_serializes_string_server_id() {
+    fn test_log_entry_formats_vm_name() {
         let entry = LogEntry {
             timestamp: Utc::now(),
             event: LogEvent::Start,
-            server_id: Some("server-uuid".to_string()),
+            vm_name: Some("gitlab-runner".to_string()),
             project: Some("group/project".to_string()),
             pipeline_id: Some(42),
             reason: "pipeline_pending".to_string(),
             duration_minutes: None,
         };
-        // Exercise the same formatting path used by `log`.
-        let server_id = entry
-            .server_id
+        let vm_name = entry
+            .vm_name
             .clone()
-            .map(|id| id.to_string())
+            .map(|n| n.to_string())
             .unwrap_or_default();
-        assert_eq!(server_id, "server-uuid");
+        assert_eq!(vm_name, "gitlab-runner");
     }
 }
